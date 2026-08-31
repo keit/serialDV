@@ -311,7 +311,11 @@ bool SerialDataController::open(const std::string& device, SERIAL_SPEED speed)
     m_device = device;
     m_speed = speed;
 
-    m_fd = ::open(m_device.c_str(), O_RDWR | O_NOCTTY | O_NDELAY, 0);
+    // Opened non-blocking only so open() itself can't stall (e.g. on carrier
+    // detect); cleared back to blocking below once termios VMIN/VTIME are in
+    // place, so reads block in the kernel on the configured timeout instead
+    // of the caller having to busy-poll in userspace.
+    m_fd = ::open(m_device.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK, 0);
 
     if (m_fd < 0)
     {
@@ -326,27 +330,15 @@ bool SerialDataController::open(const std::string& device, SERIAL_SPEED speed)
         return false;
     }
 
-    // This is an attempt to fix a bug introduced in the FTDI driver in kernel 4.4.52
-    // However this works only if you execute as root
-    // You will have to stick to an older kernel until a fix is found or run as root
-    // This bug introduces too much latency that prevents packets to flow on time
-
-    // A more persistent way to do this is to execute once per /dev/ttyUSBx lifetime:
-    // echo 1 | sudo tee /sys/bus/usb-serial/devices/ttyUSBx/latency_timer
-    // Of course replace "x" by your ttyUSB device number
-
-    struct serial_struct serial;
-
-    if (::ioctl(m_fd, TIOCGSERIAL, &serial) < 0) {
-        fprintf(stderr, "SerialDataController::open: ioctl: Cannot get serial_struct\n");
-    }
-
-    serial.flags |= ASYNC_LOW_LATENCY;
-
-    if (::ioctl(m_fd, TIOCSSERIAL, &serial) < 0) {
-        fprintf(stderr, "SerialDataController::open: ioctl: Cannot set ASYNC_LOW_LATENCY\n");
-        return false;
-    }
+    // NOTE: this used to also poke ASYNC_LOW_LATENCY via TIOCGSERIAL/TIOCSSERIAL
+    // here (a real USB control transfer to the FTDI chip's latency-timer
+    // register, intended to work around a latency bug in Linux kernel 4.4.52's
+    // ftdi_sio driver). That ioctl requires care to use safely (the old code
+    // wrote back a struct it may not have successfully read) and is redundant
+    // on kernels that already default to low latency -- check
+    // /sys/bus/usb-serial/devices/ttyUSBx/latency_timer before assuming it's
+    // needed. It's dropped here in favor of a generous VTIME below, which
+    // tolerates whatever latency the driver actually has.
 
     // Set "terminal" characteristics
 
@@ -366,7 +358,7 @@ bool SerialDataController::open(const std::string& device, SERIAL_SPEED speed)
     termios.c_cflag |= CS8;
     termios.c_oflag &= ~(OPOST);
     termios.c_cc[VMIN] = 0;
-    termios.c_cc[VTIME] = 10;
+    termios.c_cc[VTIME] = 20; // 2.0s -- matches the timeout that has proven reliable against this hardware
 
     switch (m_speed)
     {
@@ -419,6 +411,32 @@ bool SerialDataController::open(const std::string& device, SERIAL_SPEED speed)
         return false;
     }
 
+    // Explicitly assert DTR and RTS. Nothing above touches these lines, so
+    // without this they're left in whatever indeterminate state the driver
+    // happens to have -- on this hardware that's enough to leave the
+    // AMBE3000 unresponsive. Confirmed via strace against a known-working
+    // pyserial session, which asserts both immediately after configuring
+    // the port.
+    int modemBits = TIOCM_DTR | TIOCM_RTS;
+    if (::ioctl(m_fd, TIOCMBIS, &modemBits) < 0) {
+        fprintf(stderr, "SerialDataController::open: ioctl: Cannot assert DTR/RTS for %s\n", m_device.c_str());
+        ::close(m_fd);
+        return false;
+    }
+
+    // Switch to blocking I/O now that VMIN/VTIME govern how long read() waits.
+    int flags = ::fcntl(m_fd, F_GETFL, 0);
+    ::fcntl(m_fd, F_SETFL, flags & ~O_NONBLOCK);
+
+    ::tcflush(m_fd, TCIOFLUSH);
+
+    // Give the FTDI chip / AMBE3000 time to settle after the reconfiguration
+    // above before the caller sends its first byte. A known-working pyserial
+    // session has a ~200ms gap here (traced); without it, this program's
+    // first write goes out within microseconds of tcsetattr/TIOCMBIS.
+    usleep(250000);
+    ::tcflush(m_fd, TCIOFLUSH);
+
     fprintf(stderr, "SerialDataController::open: opened %s at speed %d\n",  m_device.c_str(), int(m_speed));
 
     return true;
@@ -432,60 +450,23 @@ int SerialDataController::read(unsigned char* buffer, unsigned int lengthInBytes
     if (lengthInBytes == 0U)
         return 0;
 
-    unsigned int offset = 0U;
+    // termios VMIN=0/VTIME=20 makes this a single blocking syscall: the
+    // kernel waits up to 2s for at least one byte, then returns immediately
+    // with whatever's available (which may be less than lengthInBytes). The
+    // caller (DVController::getResponse) already loops to accumulate a full
+    // packet across multiple calls, so no polling loop is needed here.
+    ssize_t len = ::read(m_fd, buffer, lengthInBytes);
 
-    while (offset < lengthInBytes)
+    if (len < 0)
     {
-        fd_set fds;
-        FD_ZERO(&fds);
-        FD_SET(m_fd, &fds);
+        if (errno == EAGAIN || errno == EINTR)
+            return 0;
 
-        int n;
-
-        if (offset == 0U)
-        {
-            struct timeval tv;
-
-            tv.tv_sec = 0;
-            tv.tv_usec = 0;
-
-            n = ::select(m_fd + 1, &fds, 0, 0, &tv);
-
-            if (n == 0) {
-                return 0;
-            }
-        }
-        else
-        {
-            n = ::select(m_fd + 1, &fds, 0, 0, 0);
-        }
-
-        if (n < 0)
-        {
-            fprintf(stderr, "SerialDataController::read: Error from select(), errno=%d", errno);
-            return -1;
-        }
-
-        if (n > 0)
-        {
-            ssize_t len = ::read(m_fd, buffer + offset, lengthInBytes - offset);
-
-            if (len < 0)
-            {
-                if (errno != EAGAIN)
-                {
-                    fprintf(stderr, "SerialDataController::read: Error from read(), errno=%d", errno);
-                    return -1;
-                }
-            }
-
-            if (len > 0) {
-                offset += len;
-            }
-        }
+        fprintf(stderr, "SerialDataController::read: Error from read(), errno=%d", errno);
+        return -1;
     }
 
-    return lengthInBytes;
+    return int(len);
 }
 
 int SerialDataController::write(const unsigned char* buffer, unsigned int lengthInBytes)
@@ -515,6 +496,12 @@ int SerialDataController::write(const unsigned char* buffer, unsigned int length
             ptr += n;
         }
     }
+
+    // Block until the kernel has actually pushed these bytes out over USB
+    // (matches pyserial's TCSBRK-as-drain after every write; without this
+    // the write() syscall can return as soon as it's buffered, before the
+    // device has actually seen the bytes).
+    ::tcdrain(m_fd);
 
     return lengthInBytes;
 }

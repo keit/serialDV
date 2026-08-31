@@ -489,7 +489,7 @@ DVController::RESP_TYPE DVController::getResponse(unsigned char* buffer, unsigne
     int packetLength, offset;
     unsigned char packetType;
 
-    for (int i = 0; i < 2000; i++)
+    for (int i = 0; i < 5; i++)
     {
         int len1 = m_serial->read(buffer, 1U);
 
@@ -517,7 +517,7 @@ DVController::RESP_TYPE DVController::getResponse(unsigned char* buffer, unsigne
     offset = 0;
     found = false;
 
-    for (int i = 0; i < 2000; i++)
+    for (int i = 0; i < 5; i++)
     {
         int len1 = m_serial->read(&buffer[1 + offset], packetLength - offset);
 
@@ -550,7 +550,13 @@ DVController::RESP_TYPE DVController::getResponse(unsigned char* buffer, unsigne
     offset = 0;
     found = false;
 
-    for (int i = 0; i < 2000; i++)
+    if (4 + packetLength > (int) length)
+    {
+        fprintf(stderr, "DVController::getResponse: packet length %d exceeds buffer, dropping\n", packetLength);
+        return RESP_ERROR;
+    }
+
+    for (int i = 0; i < 5; i++)
     {
         int len1 = m_serial->read(&buffer[4 + offset], packetLength - offset);
 
