@@ -251,6 +251,11 @@ int SerialDataController::write(const unsigned char* buffer, unsigned int length
     if (length == 0U)
     return 0;
 
+    // See the matching comment in the POSIX write() below: discard stale
+    // unread input before sending a new request, not after -- flushing
+    // after the write races the chip's own reply.
+    ::PurgeComm(m_handle, PURGE_RXCLEAR);
+
     unsigned int ptr = 0U;
 
     while (ptr < length)
@@ -477,6 +482,18 @@ int SerialDataController::write(const unsigned char* buffer, unsigned int length
     if (lengthInBytes == 0U)
         return 0;
 
+    // Discard any bytes already sitting unread in the kernel's receive
+    // buffer before sending a new request -- left over from a previous
+    // response whose payload read timed out partway through (see
+    // getResponse()'s bounded retry loop). Must happen here, strictly
+    // before this request goes out, rather than on the read side after the
+    // write: flushing after the write races the chip's own reply (a fast
+    // response can already be sitting in the input buffer by the time a
+    // post-write flush runs, discarding a *real* response instead of stale
+    // garbage). Nothing we haven't asked for yet can possibly have arrived
+    // before we've sent this request, so flushing here is always safe.
+    ::tcflush(m_fd, TCIFLUSH);
+
     unsigned int ptr = 0U;
 
     while (ptr < lengthInBytes)
@@ -521,7 +538,7 @@ void SerialDataController::closeIt()
 
 bool SerialDataController::initResponse()
 {
-    return true; // Do nothing for serial
+    return true; // Do nothing for serial -- see the input flush in write() instead
 }
 
 

@@ -485,11 +485,40 @@ DVController::RESP_TYPE DVController::getResponse(unsigned char* buffer, unsigne
         return RESP_ERROR;
     }
 
+    // Retries used to be capped at a fixed 5 attempts per stage regardless
+    // of whether the read was actively progressing. That's enough for the
+    // small control responses (PRODID/RATEP/GAIN, a handful of bytes) but
+    // not for a full 322-byte AUDIO payload: the FTDI driver hands bytes to
+    // the kernel in whatever chunks USB polling happened to batch up (with
+    // the 1ms latency_timer, often a few dozen bytes per read()), so
+    // assembling 322 bytes can legitimately take more than 5 reads even
+    // though the chip is actively, correctly sending the whole time.
+    // Cutting the read off mid-transfer doesn't stop the chip from
+    // finishing it anyway -- those never-consumed trailing bytes then show
+    // up as garbage corrupting the *next* exchange's start-byte search
+    // (confirmed by instrumenting this: a payload timeout at 221/322 bytes
+    // was immediately followed by stray non-start bytes on the next call).
+    // So retry as long as each attempt is still making forward progress,
+    // and only give up after several *consecutive* attempts return
+    // nothing at all -- that keeps the same fast failure behaviour for a
+    // genuinely unresponsive chip while giving a slow-but-live transfer as
+    // many reads as it actually needs.
+    const int maxNoProgressAttempts = 5;
+
     bool found = false;
     int packetLength, offset;
     unsigned char packetType;
+    int noProgress = 0;
+    // A stray (non-start) byte is evidence the stream is live, just not
+    // aligned yet, so it resets the no-progress counter below rather than
+    // counting against it -- but that alone would let truly endless line
+    // noise (never containing a real start byte) spin forever, so this is
+    // an independent hard cap on total bytes scanned regardless of
+    // progress: generous enough to skip past any leftover backlog, but finite.
+    const int maxStrayBytes = 256;
+    int strayBytes = 0;
 
-    for (int i = 0; i < 5; i++)
+    while (noProgress < maxNoProgressAttempts && strayBytes < maxStrayBytes)
     {
         int len1 = m_serial->read(buffer, 1U);
 
@@ -502,6 +531,15 @@ DVController::RESP_TYPE DVController::getResponse(unsigned char* buffer, unsigne
         {
             found = true;
             break;
+        }
+        else if (len1 == 1)
+        {
+            noProgress = 0;
+            strayBytes++;
+        }
+        else
+        {
+            noProgress++;
         }
 
         std::this_thread::sleep_for(std::chrono::microseconds(100));
@@ -516,8 +554,9 @@ DVController::RESP_TYPE DVController::getResponse(unsigned char* buffer, unsigne
     packetLength = 3;
     offset = 0;
     found = false;
+    noProgress = 0;
 
-    for (int i = 0; i < 5; i++)
+    while (noProgress < maxNoProgressAttempts)
     {
         int len1 = m_serial->read(&buffer[1 + offset], packetLength - offset);
 
@@ -531,9 +570,14 @@ DVController::RESP_TYPE DVController::getResponse(unsigned char* buffer, unsigne
             found = true;
             break;
         }
-        else
+        else if (len1 > 0)
         {
             offset += len1;
+            noProgress = 0;
+        }
+        else
+        {
+            noProgress++;
         }
 
         std::this_thread::sleep_for(std::chrono::microseconds(100));
@@ -541,7 +585,8 @@ DVController::RESP_TYPE DVController::getResponse(unsigned char* buffer, unsigne
 
     if (!found)
     {
-        fprintf(stderr, "DVController::getResponse: Timeout (packet header)\n");
+        fprintf(stderr, "DVController::getResponse: Timeout (packet header), got %d/%d bytes: %02x %02x %02x %02x\n",
+                offset, packetLength, buffer[0], buffer[1], buffer[2], buffer[3]);
         return RESP_ERROR;
     }
 
@@ -549,6 +594,7 @@ DVController::RESP_TYPE DVController::getResponse(unsigned char* buffer, unsigne
     packetType = buffer[3];
     offset = 0;
     found = false;
+    noProgress = 0;
 
     if (4 + packetLength > (int) length)
     {
@@ -556,7 +602,7 @@ DVController::RESP_TYPE DVController::getResponse(unsigned char* buffer, unsigne
         return RESP_ERROR;
     }
 
-    for (int i = 0; i < 5; i++)
+    while (noProgress < maxNoProgressAttempts)
     {
         int len1 = m_serial->read(&buffer[4 + offset], packetLength - offset);
 
@@ -570,16 +616,23 @@ DVController::RESP_TYPE DVController::getResponse(unsigned char* buffer, unsigne
             found = true;
             break;
         }
-        else
+        else if (len1 > 0)
         {
             offset += len1;
+            noProgress = 0;
+        }
+        else
+        {
+            noProgress++;
         }
 
         std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
 
     if (!found) {
-        fprintf(stderr, "DVController::getResponse: Timeout (packet payload)\n");
+        fprintf(stderr, "DVController::getResponse: Timeout (packet payload), got %d/%d bytes, "
+                        "header was: start=%02x len=%02x%02x type=%02x\n",
+                offset, packetLength, buffer[0], buffer[1], buffer[2], buffer[3]);
         return RESP_ERROR;
     }
 

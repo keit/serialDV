@@ -23,7 +23,14 @@
 namespace SerialDV
 {
 
-const unsigned int MBE_AUDIO_BLOCK_SIZE_INTERNAL  = 192U;
+// Must match the 160-sample (20ms @ 8kHz) framing baked into the fixed
+// DV3000_AUDIO_HEADER template's declared payload length (0x0142 = 322 =
+// 2 fixed header bytes + 160*2 audio bytes) -- every caller in this
+// codebase also sizes its PCM buffers as MBE_AUDIO_BLOCK_SIZE (160), so a
+// mismatch here both desyncs the AMBE3000's wire framing (encodeIn sends
+// more audio bytes than the header promises) and overruns the caller's
+// buffer (decodeOut writes this many samples into it).
+const unsigned int MBE_AUDIO_BLOCK_SIZE_INTERNAL  = 160U;
 const unsigned int MBE_AUDIO_BLOCK_BYTES_INTERNAL = MBE_AUDIO_BLOCK_SIZE_INTERNAL * 2U;
 const unsigned int MBE_FRAME_MAX_LENGTH_BYTES_INTERNAL = 24U;
 
