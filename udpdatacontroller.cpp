@@ -14,9 +14,13 @@
 // along with this program. If not, see <http://www.gnu.org/licenses/>.          //
 ///////////////////////////////////////////////////////////////////////////////////
 
-#include <regex>
-#include <iostream>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <algorithm>
+#include <chrono>
+#include <thread>
 
 #ifdef __WINDOWS__
 #include <winsock2.h>
@@ -25,11 +29,11 @@
 #else
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/types.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
-#include <string.h>
-#include <time.h>
 #endif
 
 #include "udpdatacontroller.h"
@@ -37,200 +41,204 @@
 namespace SerialDV
 {
 
+namespace
+{
+const int FIRST_RESPONSE_TIMEOUT_US = 500000;
+// Per 20ms audio frame. Far longer than a LAN/WiFi round trip normally takes,
+// but bounded: a lost datagram stalls the audio thread this long, no more.
+const int RESPONSE_TIMEOUT_US = 100000;
+const int RESYNC_TIMEOUT_US = 150000;
+
+#ifdef __WINDOWS__
+inline void closeSock(int fd) { closesocket(fd); }
+#else
+inline void closeSock(int fd) { ::close(fd); }
+#endif
+
+// Waits up to timeoutUs for fd to become readable.
+bool waitReadable(int fd, int timeoutUs)
+{
+    fd_set fds;
+    struct timeval tv;
+    tv.tv_sec  = timeoutUs / 1000000;
+    tv.tv_usec = timeoutUs % 1000000;
+    FD_ZERO(&fds);
+    FD_SET(fd, &fds);
+    return select(fd + 1, &fds, nullptr, nullptr, &tv) > 0 && FD_ISSET(fd, &fds);
+}
+}
+
 UDPDataController::UDPDataController() :
+    m_sockFd(-1),
     m_responseSize(0),
-    m_responseIndex(0)
+    m_responseIndex(0),
+    m_firstResponse(true)
 {
 #ifdef __WINDOWS__
     WSADATA wsa_data;
-    WSAStartup(MAKEWORD(1, 1), &wsa_data);
+    WSAStartup(MAKEWORD(2, 2), &wsa_data);
 #endif
-    m_sa = new sockaddr_in;
-    m_ra = new sockaddr_in;
 }
 
 UDPDataController::~UDPDataController()
 {
-    delete m_ra;
-    delete m_sa;
+    closeIt();
 #ifdef __WINDOWS__
     WSACleanup();
 #endif
 }
 
-bool UDPDataController::open(const std::string& ipAndPort, SERIAL_SPEED speed)
+bool UDPDataController::open(const std::string& hostAndPort, SERIAL_SPEED speed)
 {
     (void) speed;
-    std::regex ip_port_regex("(\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}):(\\d{4,5})");
-    std::smatch ip_port_match;
-    std::regex_search(ipAndPort, ip_port_match, ip_port_regex);
+    closeIt();
 
-    if (ip_port_match.size() == 3)
+    // Split at the last colon: "host:port".
+    const size_t colon = hostAndPort.rfind(':');
+    if (colon == std::string::npos || colon == 0 || colon + 1 >= hostAndPort.size())
     {
-        m_ipAddress = ip_port_match[1];
-        std::string m_port_str = ip_port_match[2];
-        m_port = atoi(m_port_str.c_str());
-
-        if (m_port < 1024)
-        {
-            std::cerr << "UDPDataController::open: not a valid port: " << m_port << std::endl;
-            return false;
-        }
-
-        openSocket(m_port);
-
-        if (m_sockFd < 0)
-        {
-            std::cerr << "UDPDataController::open: could not open socket at port: " << m_port << std::endl;
-            return false;
-        }
-
-        setSendAddress(m_ipAddress, m_port);
-
-        std::cout << "UDPDataController::open: ip: " << m_ipAddress << " port: " << m_port << std::endl;
-        return true;
-    }
-    else
-    {
-        std::cerr << "UDPDataController::open: not a valid IP address and port: " << ipAndPort << std::endl;
+        fprintf(stderr, "UDPDataController::open: expected host:port, got \"%s\"\n", hostAndPort.c_str());
         return false;
     }
+
+    const std::string host = hostAndPort.substr(0, colon);
+    const std::string portStr = hostAndPort.substr(colon + 1);
+    char *end = nullptr;
+    const long port = strtol(portStr.c_str(), &end, 10);
+    if (*end != '\0' || port < 1 || port > 65535)
+    {
+        fprintf(stderr, "UDPDataController::open: not a valid port: \"%s\"\n", portStr.c_str());
+        return false;
+    }
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    struct addrinfo *res = nullptr;
+    const int gai = getaddrinfo(host.c_str(), portStr.c_str(), &hints, &res);
+    if (gai != 0 || res == nullptr)
+    {
+        fprintf(stderr, "UDPDataController::open: cannot resolve \"%s\": %s\n", host.c_str(), gai_strerror(gai));
+        return false;
+    }
+
+    m_sockFd = (int) socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+
+    // connect() on a datagram socket just fixes the peer: the kernel then
+    // picks an ephemeral local port and drops datagrams from anyone else.
+    if (m_sockFd < 0 || connect(m_sockFd, res->ai_addr, (int) res->ai_addrlen) < 0)
+    {
+        fprintf(stderr, "UDPDataController::open: cannot set up socket to %s: %s\n",
+                hostAndPort.c_str(), strerror(errno));
+        freeaddrinfo(res);
+        closeIt();
+        return false;
+    }
+
+    freeaddrinfo(res);
+    m_responseSize = 0;
+    m_responseIndex = 0;
+    m_firstResponse = true;
+    return true;
 }
 
 bool UDPDataController::initResponse()
 {
-    m_responseSize = timeout_recvfrom((char *) m_responseBuffer, 2000, m_ra, 20000);
+    if (m_sockFd < 0) {
+        return false;
+    }
+
+    const int timeoutUs = m_firstResponse ? FIRST_RESPONSE_TIMEOUT_US : RESPONSE_TIMEOUT_US;
+    m_firstResponse = false;
+    m_responseSize = 0;
     m_responseIndex = 0;
+
+    if (!waitReadable(m_sockFd, timeoutUs)) {
+        return false;
+    }
+
+    // <= 0 covers an ICMP "port unreachable" surfacing as ECONNREFUSED when
+    // nothing is listening on the server port.
+    const int n = (int) recv(m_sockFd, (char *) m_responseBuffer, sizeof(m_responseBuffer), 0);
+    m_responseSize = n > 0 ? n : 0;
     return m_responseSize > 0;
 }
 
 int UDPDataController::read(unsigned char* buffer, unsigned int lengthInBytes)
 {
-    int remain = m_responseSize - m_responseIndex;
+    const int remain = m_responseSize - m_responseIndex;
 
-    if (remain > 0)
-    {
-        if (lengthInBytes >= (unsigned int) remain)
-        {
-            std::copy(m_responseBuffer+m_responseIndex, m_responseBuffer+m_responseSize, buffer);
-            m_responseIndex = m_responseSize;
-            return remain;
-        }
-        else
-        {
-            std::copy(m_responseBuffer+m_responseIndex, m_responseBuffer+m_responseIndex+lengthInBytes, buffer);
-            m_responseIndex += lengthInBytes;
-            return lengthInBytes;
-        }
-    }
-    else
-    {
+    if (remain <= 0) {
         return 0;
     }
+
+    const int n = std::min<int>(remain, (int) lengthInBytes);
+    std::copy(m_responseBuffer + m_responseIndex, m_responseBuffer + m_responseIndex + n, buffer);
+    m_responseIndex += n;
+    return n;
 }
 
 int UDPDataController::write(const unsigned char* buffer, unsigned int lengthInBytes)
 {
-#ifdef __WINDOWS__
-    int nbytes = sendto(m_sockFd, (const char *) buffer, lengthInBytes, 0, (const sockaddr *) m_sa, sizeof(struct sockaddr_in));
-#else
-    int nbytes = sendto(m_sockFd, buffer, lengthInBytes, 0, (const sockaddr *) m_sa, sizeof(struct sockaddr_in));
-#endif
-    return nbytes;
+    if (m_sockFd < 0) {
+        return -1;
+    }
+
+    drainPending();
+    return (int) send(m_sockFd, (const char *) buffer, lengthInBytes, 0);
+}
+
+bool UDPDataController::resync()
+{
+    if (m_sockFd < 0) {
+        return false;
+    }
+
+    // A silent AUDIO packet, the largest request there is (start 0x61,
+    // length 0x0142, type 0x02, then the 0x0200a0 field header and 160
+    // samples), so it is enough to complete any packet the chip is midway
+    // through. Its own reply is discarded.
+    unsigned char pkt[326] = {0x61, 0x01, 0x42, 0x02, 0x00, 0xa0};
+
+    for (int attempt = 0; attempt < 3; attempt++)
+    {
+        drainPending();
+
+        if (send(m_sockFd, (const char *) pkt, sizeof(pkt), 0) < 0) {
+            return false;
+        }
+
+        if (waitReadable(m_sockFd, RESYNC_TIMEOUT_US))
+        {
+            // Let any further replies to the bytes above arrive, then drop
+            // them so the retried request sees only its own.
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            drainPending();
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void UDPDataController::drainPending()
+{
+    unsigned char scratch[2000];
+
+    while (waitReadable(m_sockFd, 0)) {
+        if (recv(m_sockFd, (char *) scratch, sizeof(scratch), 0) < 0) {
+            break; // e.g. ECONNREFUSED from an earlier send; nothing more to discard
+        }
+    }
 }
 
 void UDPDataController::closeIt()
 {
-    if (m_sockFd >= 0) {
-        closeSocket();
-    }
-}
-
-void UDPDataController::openSocket(int port)
-{
-    m_sockFd = socket(AF_INET, SOCK_DGRAM, 0);
-
-    if (m_sockFd < 0)
+    if (m_sockFd >= 0)
     {
-#ifdef __WINDOWS__
-        std::cerr << "UDPDataController::openSocket: error when creating the socket: " << WSAGetLastError() << std::endl;
-#else
-        std::cerr << "UDPDataController::openSocket: error when creating the socket: " << strerror(errno) << std::endl;
-#endif
-        return;
-    }
-
-    m_ra->sin_family = AF_INET;
-    m_ra->sin_port = htons(port);
-    m_ra->sin_addr.s_addr = htonl(INADDR_ANY);
-
-    if (bind(m_sockFd, (struct sockaddr *) m_ra, sizeof(struct sockaddr_in)) < 0)
-    {
-#ifdef __WINDOWS__
-        std::cerr << "UDPDataController::openSocket: error when binding the socket to port " << port << ": " <<  WSAGetLastError() << std::endl;
-#else
-        std::cerr << "UDPDataController::openSocket: error when binding the socket to port " << port << ": " <<  strerror(errno) << std::endl;
-#endif
+        closeSock(m_sockFd);
         m_sockFd = -1;
-    }
-}
-
-void UDPDataController::closeSocket()
-{
-#ifdef __WINDOWS__
-    int rc = closesocket(m_sockFd);
-
-    if (rc < 0) {
-        std::cerr << "UDPDataController::close: error when closing the socket: " << WSAGetLastError() << std::endl;
-    } else {
-        std::cerr << "UDPDataController::close: socket closed" << std::endl;
-    }
-#else
-    int rc = close(m_sockFd);
-
-    if (rc < 0) {
-        std::cerr << "UDPDataController::close: error when closing the socket: " << strerror(errno) << std::endl;
-    } else {
-        std::cerr << "UDPDataController::close: socket closed" << std::endl;
-    }
-#endif
-}
-
-void UDPDataController::setSendAddress(std::string& address, int port)
-{
-    m_sa->sin_family = AF_INET;
-    m_sa->sin_port = htons(port);
-    m_sa->sin_addr.s_addr = inet_addr(address.c_str());
-}
-
-int UDPDataController::timeout_recvfrom(char *buf, int length, struct sockaddr_in *connection, int timeoutinmicroseconds)
-{
-    fd_set fds;
-    struct timeval tv;
-    tv.tv_sec  = timeoutinmicroseconds / 1000000;
-    tv.tv_usec = timeoutinmicroseconds % 1000000;
-    FD_ZERO(&fds);
-    FD_SET(m_sockFd, &fds);
-
-    if (select(m_sockFd + 1, &fds, nullptr, nullptr, &tv) < 0)
-    {
-#ifdef __WINDOWS__
-        std::cerr << "UDPDataController::timeout_recvfrom: error from select: " << WSAGetLastError() << std::endl;
-#else
-        std::cerr << "UDPDataController::timeout_recvfrom: error from select: " << strerror(errno) << std::endl;
-#endif
-        return 0;
-    }
-
-    if (FD_ISSET(m_sockFd, &fds))
-    {
-        socklen_t addrLen = sizeof(struct sockaddr_in);
-        return recvfrom(m_sockFd, buf, length, 0, (struct sockaddr *) connection, &addrLen);
-    }
-    else
-    {
-        std::cerr << "UDPDataController::timeout_recvfrom: no data" << std::endl;
-        return 0;
     }
 }
 

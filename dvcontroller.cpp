@@ -121,6 +121,19 @@ bool DVController::encode(const short *audioFrame, unsigned char *mbeFrame, DVRa
 	    m_currentGainIn = gain;
 	}
 	encodeIn(audioFrame, MBE_AUDIO_BLOCK_SIZE_INTERNAL);
+
+	if (encodeOut(mbeFrame, m_currentNbMbeBytes)) {
+		return true;
+	}
+
+	// No usable reply: give the transport one chance to get the link back in
+	// step (see DataController::resync), then retry this frame once.
+	if (!m_serial->resync()) {
+		return false;
+	}
+
+	fprintf(stderr, "DVController::encode: link resynchronised, retrying frame\n");
+	encodeIn(audioFrame, MBE_AUDIO_BLOCK_SIZE_INTERNAL);
 	return encodeOut(mbeFrame, m_currentNbMbeBytes);
 }
 
@@ -143,6 +156,18 @@ bool DVController::decode(short *audioFrame, const unsigned char *mbeFrame, DVRa
         m_currentGainOut = gain;
     }
 
+	decodeIn(mbeFrame, m_currentNbMbeBits, m_currentNbMbeBytes);
+
+	if (decodeOut(audioFrame, MBE_AUDIO_BLOCK_SIZE_INTERNAL)) {
+		return true;
+	}
+
+	// Same recovery as encode(): resync the link, retry this frame once.
+	if (!m_serial->resync()) {
+		return false;
+	}
+
+	fprintf(stderr, "DVController::decode: link resynchronised, retrying frame\n");
 	decodeIn(mbeFrame, m_currentNbMbeBits, m_currentNbMbeBytes);
 	return decodeOut(audioFrame, MBE_AUDIO_BLOCK_SIZE_INTERNAL);
 }

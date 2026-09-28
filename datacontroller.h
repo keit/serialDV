@@ -61,6 +61,12 @@ public:
 
     virtual void closeIt() = 0;
 
+    // Called by DVController when a request got no usable reply, to get the
+    // link back in step before the request is retried once. Returns true if
+    // the link answers again. Transports that can't lose framing this way
+    // (a local serial port) leave the default, which just says "no".
+    virtual bool resync() { return false; }
+
 #ifdef __WINDOWS__
     static const unsigned int BUFFER_LENGTH = 1000U;
 #else
