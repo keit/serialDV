@@ -17,6 +17,7 @@
 #ifndef DVCONTROLLER_H_
 #define DVCONTROLLER_H_
 
+#include <atomic>
 #include <string>
 
 #include "serialdv_export.h"
@@ -122,6 +123,21 @@ public:
 	 */
 	bool decode(short *audioFrame, const unsigned char *mbeFrame, DVRate rate, int gain = 0);
 
+	/** Number of encode()/decode() calls in a row that got no usable reply
+	 * from the vocoder (0 while it is answering). Safe to read from any
+	 * thread, e.g. a GUI polling for a status display.
+	 */
+	unsigned int consecutiveFailures() const { return m_consecutiveFailures.load(); }
+
+	/** consecutiveFailures() at or above this counts as "not responding":
+	 * isResponding() turns false, per-frame error logging goes quiet (one
+	 * line when it stops answering, one when it recovers), and the slow
+	 * link resync is only retried now and then instead of on every frame.
+	 */
+	static const unsigned int NOT_RESPONDING_THRESHOLD = 10;
+
+	bool isResponding() const { return consecutiveFailures() < NOT_RESPONDING_THRESHOLD; }
+
 	/** Returns the number of bytes in a MBE frame given the MBE rate
 	 */
 	static unsigned short getNbMbeBytes(DVRate mbeRate);
@@ -151,6 +167,18 @@ private:
     unsigned char m_currentNbMbeBits;
     unsigned short m_currentNbMbeBytes;
     bool m_littleEndian;
+    std::atomic<unsigned int> m_consecutiveFailures;
+
+    /** Updates m_consecutiveFailures from one encode()/decode() result,
+     * logging when the vocoder stops or starts answering again; returns ok.
+     */
+    bool noteResult(bool ok);
+    /** Whether a failed frame should try DataController::resync(): always
+     * while the vocoder is answering, only every RESYNC_EVERY failures once
+     * it isn't -- each resync can stall the caller for ~0.5s, which would
+     * otherwise hold up the audio/network threads for as long as it's down.
+     */
+    bool shouldResync() const;
 
     bool isLittleEndian()
     {

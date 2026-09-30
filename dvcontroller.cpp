@@ -39,7 +39,8 @@ DVController::DVController() :
         m_currentGainIn(0),
         m_currentGainOut(0),
         m_currentNbMbeBits(72),
-        m_currentNbMbeBytes(9)
+        m_currentNbMbeBytes(9),
+        m_consecutiveFailures(0)
 {
     m_littleEndian = isLittleEndian();
 }
@@ -123,18 +124,20 @@ bool DVController::encode(const short *audioFrame, unsigned char *mbeFrame, DVRa
 	encodeIn(audioFrame, MBE_AUDIO_BLOCK_SIZE_INTERNAL);
 
 	if (encodeOut(mbeFrame, m_currentNbMbeBytes)) {
-		return true;
+		return noteResult(true);
 	}
 
 	// No usable reply: give the transport one chance to get the link back in
 	// step (see DataController::resync), then retry this frame once.
-	if (!m_serial->resync()) {
-		return false;
+	if (!shouldResync() || !m_serial->resync()) {
+		return noteResult(false);
 	}
 
-	fprintf(stderr, "DVController::encode: link resynchronised, retrying frame\n");
+	if (isResponding()) {
+		fprintf(stderr, "DVController::encode: link resynchronised, retrying frame\n");
+	}
 	encodeIn(audioFrame, MBE_AUDIO_BLOCK_SIZE_INTERNAL);
-	return encodeOut(mbeFrame, m_currentNbMbeBytes);
+	return noteResult(encodeOut(mbeFrame, m_currentNbMbeBytes));
 }
 
 
@@ -159,17 +162,44 @@ bool DVController::decode(short *audioFrame, const unsigned char *mbeFrame, DVRa
 	decodeIn(mbeFrame, m_currentNbMbeBits, m_currentNbMbeBytes);
 
 	if (decodeOut(audioFrame, MBE_AUDIO_BLOCK_SIZE_INTERNAL)) {
-		return true;
+		return noteResult(true);
 	}
 
 	// Same recovery as encode(): resync the link, retry this frame once.
-	if (!m_serial->resync()) {
-		return false;
+	if (!shouldResync() || !m_serial->resync()) {
+		return noteResult(false);
 	}
 
-	fprintf(stderr, "DVController::decode: link resynchronised, retrying frame\n");
+	if (isResponding()) {
+		fprintf(stderr, "DVController::decode: link resynchronised, retrying frame\n");
+	}
 	decodeIn(mbeFrame, m_currentNbMbeBits, m_currentNbMbeBytes);
-	return decodeOut(audioFrame, MBE_AUDIO_BLOCK_SIZE_INTERNAL);
+	return noteResult(decodeOut(audioFrame, MBE_AUDIO_BLOCK_SIZE_INTERNAL));
+}
+
+bool DVController::noteResult(bool ok)
+{
+	if (ok)
+	{
+		const unsigned int failed = m_consecutiveFailures.exchange(0);
+
+		if (failed >= NOT_RESPONDING_THRESHOLD) {
+			fprintf(stderr, "DVController: vocoder responding again after %u failed frames\n", failed);
+		}
+	}
+	else if (++m_consecutiveFailures == NOT_RESPONDING_THRESHOLD)
+	{
+		fprintf(stderr, "DVController: no reply for %u frames in a row, vocoder not responding "
+		                "(further per-frame errors suppressed until it recovers)\n", NOT_RESPONDING_THRESHOLD);
+	}
+
+	return ok;
+}
+
+bool DVController::shouldResync() const
+{
+	const unsigned int RESYNC_EVERY = 25;
+	return isResponding() || m_consecutiveFailures.load() % RESYNC_EVERY == 0;
 }
 
 unsigned short DVController::getNbMbeBytes(DVRate mbeRate)
@@ -336,7 +366,9 @@ bool DVController::encodeOut(unsigned char* ambe, unsigned int length)
 
     if (type != RESP_AMBE)
     {
-        fprintf(stderr, "DVController::encodeOut: error\n");
+        if (isResponding()) {
+            fprintf(stderr, "DVController::encodeOut: error\n");
+        }
         return false;
     }
 
@@ -383,7 +415,9 @@ bool DVController::decodeOut(short* audio, unsigned int length)
 
     if (type != RESP_AUDIO)
     {
-        fprintf(stderr, "DVController::decodeOut: error\n");
+        if (isResponding()) {
+            fprintf(stderr, "DVController::decodeOut: error\n");
+        }
         return false;
     }
 
@@ -506,7 +540,7 @@ DVController::RESP_TYPE DVController::getResponse(unsigned char* buffer, unsigne
 
     if (!m_serial->initResponse())
     {
-        fprintf(stderr, "DVController::getResponse: cannot get response\n");
+        if (isResponding()) fprintf(stderr, "DVController::getResponse: cannot get response\n");
         return RESP_ERROR;
     }
 
@@ -549,7 +583,7 @@ DVController::RESP_TYPE DVController::getResponse(unsigned char* buffer, unsigne
 
         if (len1 < 0)
         {
-            fprintf(stderr, "DVController::getResponse: Error (start byte)\n");
+            if (isResponding()) fprintf(stderr, "DVController::getResponse: Error (start byte)\n");
             return RESP_ERROR;
         }
         else if ((len1 == 1) && (buffer[0U] == DV3000_START_BYTE))
@@ -572,7 +606,7 @@ DVController::RESP_TYPE DVController::getResponse(unsigned char* buffer, unsigne
 
     if (!found)
     {
-        fprintf(stderr, "DVController::getResponse: Timeout (start byte)\n");
+        if (isResponding()) fprintf(stderr, "DVController::getResponse: Timeout (start byte)\n");
         return RESP_ERROR;
     }
 
@@ -587,7 +621,7 @@ DVController::RESP_TYPE DVController::getResponse(unsigned char* buffer, unsigne
 
         if (len1 < 0)
         {
-            fprintf(stderr, "DVController::getResponse: Error (packet header at %d)\n", offset);
+            if (isResponding()) fprintf(stderr, "DVController::getResponse: Error (packet header at %d)\n", offset);
             return RESP_ERROR;
         }
         else if (offset + len1 == packetLength)
@@ -610,7 +644,7 @@ DVController::RESP_TYPE DVController::getResponse(unsigned char* buffer, unsigne
 
     if (!found)
     {
-        fprintf(stderr, "DVController::getResponse: Timeout (packet header), got %d/%d bytes: %02x %02x %02x %02x\n",
+        if (isResponding()) fprintf(stderr, "DVController::getResponse: Timeout (packet header), got %d/%d bytes: %02x %02x %02x %02x\n",
                 offset, packetLength, buffer[0], buffer[1], buffer[2], buffer[3]);
         return RESP_ERROR;
     }
@@ -623,7 +657,7 @@ DVController::RESP_TYPE DVController::getResponse(unsigned char* buffer, unsigne
 
     if (4 + packetLength > (int) length)
     {
-        fprintf(stderr, "DVController::getResponse: packet length %d exceeds buffer, dropping\n", packetLength);
+        if (isResponding()) fprintf(stderr, "DVController::getResponse: packet length %d exceeds buffer, dropping\n", packetLength);
         return RESP_ERROR;
     }
 
@@ -633,7 +667,7 @@ DVController::RESP_TYPE DVController::getResponse(unsigned char* buffer, unsigne
 
         if (len1 < 0)
         {
-            fprintf(stderr, "DVController::getResponse: Error (packet payload at %d)\n", offset);
+            if (isResponding()) fprintf(stderr, "DVController::getResponse: Error (packet payload at %d)\n", offset);
             return RESP_ERROR;
         }
         else if (offset + len1 == packetLength)
@@ -655,7 +689,7 @@ DVController::RESP_TYPE DVController::getResponse(unsigned char* buffer, unsigne
     }
 
     if (!found) {
-        fprintf(stderr, "DVController::getResponse: Timeout (packet payload), got %d/%d bytes, "
+        if (isResponding()) fprintf(stderr, "DVController::getResponse: Timeout (packet payload), got %d/%d bytes, "
                         "header was: start=%02x len=%02x%02x type=%02x\n",
                 offset, packetLength, buffer[0], buffer[1], buffer[2], buffer[3]);
         return RESP_ERROR;
