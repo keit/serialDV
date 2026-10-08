@@ -18,6 +18,7 @@
 #define DVCONTROLLER_H_
 
 #include <atomic>
+#include <chrono>
 #include <string>
 
 #include "serialdv_export.h"
@@ -138,6 +139,18 @@ public:
 
 	bool isResponding() const { return consecutiveFailures() < NOT_RESPONDING_THRESHOLD; }
 
+	/** How long encode()/decode() round trips have been taking lately, in
+	 * microseconds: a moving average over roughly the last 16 frames, or 0
+	 * if there were none in the last second (no audio going through).
+	 * Each frame waits for its reply before the next is sent, so real-time
+	 * audio needs these below 20000 (one 20 ms frame): above that, audio
+	 * falls further behind with every frame and breaks up -- e.g. a remote
+	 * ThumbDV whose FTDI latency timer is still at its 16 ms default. Safe
+	 * to read from any thread.
+	 */
+	unsigned int recentEncodeMicros() const { return recentMicros(m_encodeTiming); }
+	unsigned int recentDecodeMicros() const { return recentMicros(m_decodeTiming); }
+
 	/** Returns the number of bytes in a MBE frame given the MBE rate
 	 */
 	static unsigned short getNbMbeBytes(DVRate mbeRate);
@@ -168,6 +181,21 @@ private:
     unsigned short m_currentNbMbeBytes;
     bool m_littleEndian;
     std::atomic<unsigned int> m_consecutiveFailures;
+
+    /** Round-trip timing for recentEncodeMicros()/recentDecodeMicros().
+     * Written by whichever single thread does that direction's work,
+     * read from any.
+     */
+    struct Timing {
+        std::atomic<unsigned int> averageMicros{0};
+        std::atomic<long long> lastSampleNanos{0}; //!< steady_clock time of the last sample
+    };
+    Timing m_encodeTiming;
+    Timing m_decodeTiming;
+
+    /** Adds the round trip that began at start to timing's average. */
+    static void noteTiming(Timing &timing, std::chrono::steady_clock::time_point start);
+    static unsigned int recentMicros(const Timing &timing);
 
     /** Updates m_consecutiveFailures from one encode()/decode() result,
      * logging when the vocoder stops or starts answering again; returns ok.

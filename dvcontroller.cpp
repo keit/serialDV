@@ -121,9 +121,11 @@ bool DVController::encode(const short *audioFrame, unsigned char *mbeFrame, DVRa
 	    setGain(gain, m_currentGainOut);
 	    m_currentGainIn = gain;
 	}
+	const auto start = std::chrono::steady_clock::now();
 	encodeIn(audioFrame, MBE_AUDIO_BLOCK_SIZE_INTERNAL);
 
 	if (encodeOut(mbeFrame, m_currentNbMbeBytes)) {
+		noteTiming(m_encodeTiming, start);
 		return noteResult(true);
 	}
 
@@ -159,9 +161,11 @@ bool DVController::decode(short *audioFrame, const unsigned char *mbeFrame, DVRa
         m_currentGainOut = gain;
     }
 
+	const auto start = std::chrono::steady_clock::now();
 	decodeIn(mbeFrame, m_currentNbMbeBits, m_currentNbMbeBytes);
 
 	if (decodeOut(audioFrame, MBE_AUDIO_BLOCK_SIZE_INTERNAL)) {
+		noteTiming(m_decodeTiming, start);
 		return noteResult(true);
 	}
 
@@ -175,6 +179,32 @@ bool DVController::decode(short *audioFrame, const unsigned char *mbeFrame, DVRa
 	}
 	decodeIn(mbeFrame, m_currentNbMbeBits, m_currentNbMbeBytes);
 	return noteResult(decodeOut(audioFrame, MBE_AUDIO_BLOCK_SIZE_INTERNAL));
+}
+
+void DVController::noteTiming(Timing &timing, std::chrono::steady_clock::time_point start)
+{
+	const auto now = std::chrono::steady_clock::now();
+	const unsigned int micros = (unsigned int) std::chrono::duration_cast<std::chrono::microseconds>(now - start).count();
+	const long long nowNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+
+	// After a pause (nothing in the last second) start the average afresh
+	// from this frame, so it never carries over from a previous call.
+	unsigned int average = timing.averageMicros.load();
+	if (nowNanos - timing.lastSampleNanos.load() > 1000000000LL) {
+		average = micros;
+	} else {
+		average = average - average / 16 + micros / 16;
+	}
+
+	timing.averageMicros.store(average);
+	timing.lastSampleNanos.store(nowNanos);
+}
+
+unsigned int DVController::recentMicros(const Timing &timing)
+{
+	const long long nowNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count();
+	return nowNanos - timing.lastSampleNanos.load() > 1000000000LL ? 0 : timing.averageMicros.load();
 }
 
 bool DVController::noteResult(bool ok)
