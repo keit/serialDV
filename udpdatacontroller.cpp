@@ -185,7 +185,9 @@ int UDPDataController::write(const unsigned char* buffer, unsigned int lengthInB
         return -1;
     }
 
-    drainPending();
+    if (!m_keepPendingReplies) {
+        drainPending();
+    }
     return (int) send(m_sockFd, (const char *) buffer, lengthInBytes, 0);
 }
 

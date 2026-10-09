@@ -53,6 +53,7 @@ public:
     // enough bytes arrive to finish it. Sending a full-size silent audio
     // frame does that, and the reply to it shows the link is back.
     virtual bool resync();
+    virtual void discardPending() { drainPending(); }
 
 private:
     // Discards any datagrams already waiting: a reply that arrived after its

@@ -67,11 +67,25 @@ public:
     // (a local serial port) leave the default, which just says "no".
     virtual bool resync() { return false; }
 
+    // For pipelined use, with several requests in flight at once (see
+    // DVController::beginPipelining()). Normally write() first discards
+    // any unread input as stale -- with one request at a time, anything
+    // already waiting can only be left over from an earlier one. With
+    // several in flight it's the replies still to be collected, so this
+    // turns that off, and discardPending() clears stale input explicitly,
+    // at a moment when nothing is in flight. Set only while no other
+    // thread is using the controller.
+    void setKeepPendingReplies(bool keep) { m_keepPendingReplies = keep; }
+    virtual void discardPending() {}
+
 #ifdef __WINDOWS__
     static const unsigned int BUFFER_LENGTH = 1000U;
 #else
     static const unsigned int BUFFER_LENGTH = 400U;
 #endif
+
+protected:
+    bool m_keepPendingReplies = false;
 };
 
 } // namespace SerialDV

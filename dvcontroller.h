@@ -142,14 +142,45 @@ public:
 	/** How long encode()/decode() round trips have been taking lately, in
 	 * microseconds: a moving average over roughly the last 16 frames, or 0
 	 * if there were none in the last second (no audio going through).
-	 * Each frame waits for its reply before the next is sent, so real-time
-	 * audio needs these below 20000 (one 20 ms frame): above that, audio
-	 * falls further behind with every frame and breaks up -- e.g. a remote
-	 * ThumbDV whose FTDI latency timer is still at its 16 ms default. Safe
-	 * to read from any thread.
+	 * Pipelined requests (see beginPipelining()) report via noteRoundTrip().
+	 * Used one at a time, each frame waits for its reply, so real-time
+	 * audio needs these below 20000 (one 20 ms frame) -- e.g. a remote
+	 * ThumbDV whose FTDI latency timer is at its 16 ms default runs ~33 ms
+	 * and falls further behind with every frame. Pipelined, a slow round
+	 * trip only delays audio, and a steadily climbing figure means replies
+	 * are coming slower than requests. Safe to read from any thread.
 	 */
 	unsigned int recentEncodeMicros() const { return recentMicros(m_encodeTiming); }
 	unsigned int recentDecodeMicros() const { return recentMicros(m_decodeTiming); }
+
+	/** Pipelined use: send requests without waiting for each reply, and
+	 * collect the replies -- in the order the requests went out, since the
+	 * vocoder answers them in turn -- on another thread. A slow link (a
+	 * remote ThumbDV, a 16 ms FTDI latency timer) then only delays audio
+	 * instead of limiting it to one frame per round trip.
+	 *
+	 * beginPipelining() sets the rate for the whole session (gain stays 0)
+	 * and switches the transport to keep waiting replies (see
+	 * DataController::setKeepPendingReplies); call it, and
+	 * endPipelining(), with nothing else using the controller. In between,
+	 * use only the calls below -- not encode()/decode() -- with one thread
+	 * sending and one receiving. Replies carry nothing to match them to
+	 * their requests, so after any failed receive the caller should stop
+	 * sending, collect (or time out) everything still in flight, and call
+	 * discardPendingReplies() before sending again; otherwise a late reply
+	 * would be taken for the next request's.
+	 */
+	bool beginPipelining(DVRate rate);
+	void endPipelining();
+	void sendEncode(const short *audioFrame);
+	bool receiveEncode(unsigned char *mbeFrame);
+	void sendDecode(const unsigned char *mbeFrame);
+	bool receiveDecode(short *audioFrame);
+	void discardPendingReplies();
+	/** Feeds recentEncodeMicros()/recentDecodeMicros() for a pipelined
+	 * request sent at sent and just answered.
+	 */
+	void noteRoundTrip(bool encode, std::chrono::steady_clock::time_point sent);
 
 	/** Returns the number of bytes in a MBE frame given the MBE rate
 	 */

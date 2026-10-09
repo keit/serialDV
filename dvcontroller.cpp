@@ -207,6 +207,68 @@ unsigned int DVController::recentMicros(const Timing &timing)
 	return nowNanos - timing.lastSampleNanos.load() > 1000000000LL ? 0 : timing.averageMicros.load();
 }
 
+bool DVController::beginPipelining(DVRate rate)
+{
+	if (!m_open) {
+		return false;
+	}
+
+	if (rate != m_currentRate)
+	{
+	    if (!setRate(rate)) {
+	        return false;
+	    }
+	    m_currentRate = rate;
+	}
+
+	if (m_currentGainIn != 0 || m_currentGainOut != 0)
+	{
+	    setGain(0, 0);
+	    m_currentGainIn = m_currentGainOut = 0;
+	}
+
+	m_serial->discardPending();
+	m_serial->setKeepPendingReplies(true);
+	return true;
+}
+
+void DVController::endPipelining()
+{
+	if (m_open) {
+		m_serial->setKeepPendingReplies(false);
+	}
+}
+
+void DVController::sendEncode(const short *audioFrame)
+{
+	encodeIn(audioFrame, MBE_AUDIO_BLOCK_SIZE_INTERNAL);
+}
+
+bool DVController::receiveEncode(unsigned char *mbeFrame)
+{
+	return noteResult(encodeOut(mbeFrame, m_currentNbMbeBytes));
+}
+
+void DVController::sendDecode(const unsigned char *mbeFrame)
+{
+	decodeIn(mbeFrame, m_currentNbMbeBits, m_currentNbMbeBytes);
+}
+
+bool DVController::receiveDecode(short *audioFrame)
+{
+	return noteResult(decodeOut(audioFrame, MBE_AUDIO_BLOCK_SIZE_INTERNAL));
+}
+
+void DVController::discardPendingReplies()
+{
+	m_serial->discardPending();
+}
+
+void DVController::noteRoundTrip(bool encode, std::chrono::steady_clock::time_point sent)
+{
+	noteTiming(encode ? m_encodeTiming : m_decodeTiming, sent);
+}
+
 bool DVController::noteResult(bool ok)
 {
 	if (ok)

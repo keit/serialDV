@@ -254,7 +254,9 @@ int SerialDataController::write(const unsigned char* buffer, unsigned int length
     // See the matching comment in the POSIX write() below: discard stale
     // unread input before sending a new request, not after -- flushing
     // after the write races the chip's own reply.
-    ::PurgeComm(m_handle, PURGE_RXCLEAR);
+    if (!m_keepPendingReplies) {
+        ::PurgeComm(m_handle, PURGE_RXCLEAR);
+    }
 
     unsigned int ptr = 0U;
 
@@ -294,6 +296,12 @@ void SerialDataController::closeIt()
 
     ::CloseHandle(m_readOverlapped.hEvent);
     ::CloseHandle(m_writeOverlapped.hEvent);
+}
+
+
+void SerialDataController::discardPending()
+{
+    ::PurgeComm(m_handle, PURGE_RXCLEAR);
 }
 
 #else
@@ -491,8 +499,11 @@ int SerialDataController::write(const unsigned char* buffer, unsigned int length
     // response can already be sitting in the input buffer by the time a
     // post-write flush runs, discarding a *real* response instead of stale
     // garbage). Nothing we haven't asked for yet can possibly have arrived
-    // before we've sent this request, so flushing here is always safe.
-    ::tcflush(m_fd, TCIFLUSH);
+    // before we've sent this request, so flushing here is always safe --
+    // unless other requests are still in flight (see setKeepPendingReplies).
+    if (!m_keepPendingReplies) {
+        ::tcflush(m_fd, TCIFLUSH);
+    }
 
     unsigned int ptr = 0U;
 
@@ -532,6 +543,11 @@ void SerialDataController::closeIt()
     m_device.clear();
     m_speed = SERIAL_NONE;
     m_fd = -1;
+}
+
+void SerialDataController::discardPending()
+{
+    ::tcflush(m_fd, TCIFLUSH);
 }
 
 #endif // WINDOWS

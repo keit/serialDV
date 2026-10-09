@@ -37,6 +37,7 @@ public:
     virtual int  write(const unsigned char* buffer, unsigned int lengthInBytes);
 
     virtual void closeIt();
+    virtual void discardPending();
 
 private:
     std::string    m_device;
